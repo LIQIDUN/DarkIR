@@ -15,7 +15,7 @@ args = parser.parse_args()
 
 path_options = args.config
 opt = parse(path_options)
-os.environ["CUDA_VISIBLE_DEVICES"]= "1"
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"
 
 # PyTorch library
 import torch
@@ -105,32 +105,62 @@ def predict_folder(rank, world_size):
     model.eval()
     if rank==0:
         pbar = tqdm(total = len(path_images))
-        
+
     for path_img in path_images:
         tensor = path_to_tensor(path_img).to(device)
         _, _, H, W = tensor.shape
         
-        if resize and (H >=1500 or W>=1500):
-            new_size = [int(dim//2) for dim in (H, W)]
+        # 适配显存限制
+        max_dim = max(H, W)
+        # 设定最大安全边长阈值
+        if max_dim > 1080:  
+            scale = 1080 / max_dim
+            new_size = [int(H * scale), int(W * scale)]
             downsample = Resize(new_size)
+            do_resize = True
         else:
             downsample = torch.nn.Identity()
+            do_resize = False
+            
         tensor = downsample(tensor)
-        
-        tensor = pad_tensor(tensor)
+        tensor = pad_tensor(tensor) 
 
+        # 抑制过曝光晕
         with torch.no_grad():
-            output = model(tensor, side_loss=False)
-        if resize:
+            # 长曝光推理：提取暗部细节，但高光会过曝
+            out_normal = model(tensor, side_loss=False)
+            
+            # 短曝光推理：通过线性衰减输入以压缩动态范围
+            gamma_ratio = 0.35 # 压暗系数
+            tensor_dark = tensor * gamma_ratio 
+            out_dark = model(tensor_dark, side_loss=False)
+            
+        # 若触发降采样，则通过插值恢复至原始空间分辨率
+        if do_resize:
             upsample = Resize((H, W))
-        else: upsample = torch.nn.Identity()
-        output = upsample(output)
-        output = torch.clamp(output, 0., 1.)
-        output = output[:,:, :H, :W]
-        save_tensor(output, os.path.join(PATH_RESULTS, os.path.basename(path_img)))
+            out_normal = upsample(out_normal)
+            out_dark = upsample(out_dark)
+        else: 
+            upsample = torch.nn.Identity()
 
+        # 数据格式转换：PyTorch Tensor 转为 OpenCV 兼容格式
+        import numpy as np
+        out_n_np = (torch.clamp(out_normal[:,:,:H,:W], 0, 1).squeeze(0).permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
+        out_d_np = (torch.clamp(out_dark[:,:,:H,:W], 0, 1).squeeze(0).permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
+        
+        out_n_bgr = cv.cvtColor(out_n_np, cv.COLOR_RGB2BGR)
+        out_d_bgr = cv.cvtColor(out_d_np, cv.COLOR_RGB2BGR)
 
+        # 多曝光融合：利用 Mertens 算法与拉普拉斯金字塔，进行加权缝合
+        merge_mertens = cv.createMergeMertens()
+        fusion_float = merge_mertens.process([out_d_bgr, out_n_bgr]) 
+        improved_img = np.clip(fusion_float * 255.0, 0, 255).astype(np.uint8)
+
+        # 保存基准结果和改进结果
+        cv.imwrite(os.path.join(PATH_RESULTS, "Baseline_" + os.path.basename(path_img)), out_n_bgr)
+        cv.imwrite(os.path.join(PATH_RESULTS, "Improved_" + os.path.basename(path_img)), improved_img)
         pbar.update(1)
+
         pass
 
     print('Finished inference!')
